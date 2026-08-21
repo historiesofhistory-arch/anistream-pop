@@ -20,6 +20,14 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- PERF: preconnect to AniList + api.bine.me so the first API call after
+         page transition doesn't pay the DNS+TLS handshake cost. AniList is
+         hit by every page (search, browse, home, details, episodes); api.bine.me
+         supplies episode thumbnails + clear logos. Preconnect is free if the
+         origin is never actually used. -->
+    <link rel="preconnect" href="https://graphql.anilist.co">
+    <link rel="preconnect" href="https://api.bine.me">
+    <link rel="preconnect" href="https://simkl.in" crossorigin>
   </head>
   <body>
     <div id="root"></div>

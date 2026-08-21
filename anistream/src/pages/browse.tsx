@@ -4,6 +4,7 @@ import { Search, SlidersHorizontal, X, ChevronDown, Star, Tv2, Film } from "luci
 import { useQuery } from "@tanstack/react-query";
 import { cn } from "../lib/utils";
 import { apiUrl } from "../lib/api";
+import { withClientHeader } from "../lib/custom-fetch";
 import { motion, AnimatePresence } from "framer-motion";
 import { staggerContainer, staggerChild } from "../lib/transitions";
 
@@ -206,7 +207,7 @@ export function Browse() {
 
   const { data, isFetching } = useQuery<BrowseResult>({
     queryKey: ["browse", filters],
-    queryFn: () => fetch(buildUrl(filters)).then(r => r.json()),
+    queryFn: () => fetch(buildUrl(filters), { headers: withClientHeader() }).then(r => r.json()),
     staleTime: 3 * 60 * 1000,
     placeholderData: (prev) => prev,
   });

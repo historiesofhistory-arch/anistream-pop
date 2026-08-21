@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { cn } from "../lib/utils";
 import { apiUrl } from "../lib/api";
+import { withClientHeader } from "../lib/custom-fetch";
 import {
   squishyTap, squishyHover, staggerContainer, staggerChild,
 } from "../lib/transitions";
@@ -62,14 +63,14 @@ export function Search() {
 
   const { data: searchResults, isLoading, isError } = useQuery<{ results: { id: number; title: string; posterUrl: string; type?: string | null; year?: number | null; rating?: number | null }[] }>({
     queryKey: ["anime-search", searchQuery],
-    queryFn: () => fetch(apiUrl(`/api/anime/search?q=${encodeURIComponent(searchQuery)}`)).then(r => r.json()),
+    queryFn: () => fetch(apiUrl(`/api/anime/search?q=${encodeURIComponent(searchQuery)}`), { headers: withClientHeader() }).then(r => r.json()),
     enabled: searchQuery.length >= 3,
     staleTime: 5 * 60 * 1000,
   });
 
   const { data: trendingData } = useQuery<{ results: { id: number; title: string; posterUrl: string; type?: string | null; year?: number | null }[] }>({
     queryKey: ["anime-trending-for-search"],
-    queryFn: () => fetch(apiUrl(`/api/home`)).then(r => r.json()).then(d => {
+    queryFn: () => fetch(apiUrl(`/api/home`), { headers: withClientHeader() }).then(r => r.json()).then(d => {
       // Flatten the first 2 home sections as "trending" suggestions
       const sections = d?.sections ?? [];
       const flat: any[] = [];

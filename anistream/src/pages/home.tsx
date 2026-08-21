@@ -5,6 +5,7 @@ import { RowSlider } from "../components/row-slider";
 import { useQuery } from "@tanstack/react-query";
 import { cn } from "../lib/utils";
 import { apiUrl } from "../lib/api";
+import { withClientHeader } from "../lib/custom-fetch";
 import { useContinueWatching } from "../lib/continue-watching";
 import { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
@@ -58,14 +59,14 @@ interface UpcomingItem {
 function useHomeSections() {
   return useQuery<{ hero: HeroItem[]; sections: HomeSection[]; genres?: BrowseGenre[] }>({
     queryKey: ["home-sections"],
-    queryFn: () => fetch(apiUrl("/api/home")).then(r => r.json()),
+    queryFn: () => fetch(apiUrl("/api/home"), { headers: withClientHeader() }).then(r => r.json()),
     staleTime: 8 * 60 * 1000,
   });
 }
 function useUpcoming() {
   return useQuery<{ items: UpcomingItem[] }>({
     queryKey: ["upcoming"],
-    queryFn: () => fetch(apiUrl("/api/upcoming")).then(r => r.json()),
+    queryFn: () => fetch(apiUrl("/api/upcoming"), { headers: withClientHeader() }).then(r => r.json()),
     staleTime: 15 * 60 * 1000,
     retry: false,
   });

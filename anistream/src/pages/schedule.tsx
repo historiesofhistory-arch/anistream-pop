@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { cn } from "../lib/utils";
 import { apiUrl } from "../lib/api";
+import { withClientHeader } from "../lib/custom-fetch";
 import { motion, AnimatePresence } from "framer-motion";
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -97,7 +98,8 @@ function useSchedule() {
     queryKey: ["anime-schedule"],
     queryFn: () =>
       fetch(
-        apiUrl(`/api/anime/schedule?tz=${encodeURIComponent(USER_TZ)}`)
+        apiUrl(`/api/anime/schedule?tz=${encodeURIComponent(USER_TZ)}`),
+        { headers: withClientHeader() }
       ).then((r) => r.json()),
     staleTime: 5 * 60 * 1000,
   });

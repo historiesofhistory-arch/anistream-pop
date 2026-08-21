@@ -1,5 +1,5 @@
 import { useParams, Link, useLocation } from "wouter";
-import { customFetch } from "../lib/custom-fetch";
+import { customFetch, withClientHeader } from "../lib/custom-fetch";
 import { apiUrl } from "../lib/api";
 import { saveToContinueWatching } from "../lib/continue-watching";
 import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
@@ -242,7 +242,8 @@ export function Watch() {
         queryKey: ["/api/stream", id, epId, activeProvider, selectedLang],
         queryFn: () =>
           fetch(
-            apiUrl(`/api/anime/${id}/stream/${epId}?lang=${selectedLang}&provider=${activeProvider}`)
+            apiUrl(`/api/anime/${id}/stream/${epId}?lang=${selectedLang}&provider=${activeProvider}`),
+            { headers: withClientHeader() }
           ).then((r) => r.json()),
         staleTime: 5 * 60 * 1000,
       });
@@ -254,7 +255,7 @@ export function Watch() {
 
   const { data: animeDetails } = useQuery({
     queryKey: ["anime-details", id],
-    queryFn: () => fetch(apiUrl(`/api/anime/${id}/details`)).then(r => r.json()),
+    queryFn: () => fetch(apiUrl(`/api/anime/${id}/details`), { headers: withClientHeader() }).then(r => r.json()),
     staleTime: 5 * 60 * 1000,
   });
 
@@ -264,7 +265,7 @@ export function Watch() {
   // the watch page falls back to its default black-screen loading state.
   const { data: logoData } = useQuery<{ logoUrl: string | null }>({
     queryKey: ["anime-logo", id],
-    queryFn: () => fetch(apiUrl(`/api/anime/${id}/logo`)).then(r => r.json()),
+    queryFn: () => fetch(apiUrl(`/api/anime/${id}/logo`), { headers: withClientHeader() }).then(r => r.json()),
     staleTime: Infinity,        // TVDB slugs never change — cache forever
     retry: false,               // Don't retry on failure — fall back silently
   });
@@ -272,14 +273,14 @@ export function Watch() {
 
   const { data: seasonsData } = useQuery<{ seasons: Season[] }>({
     queryKey: ["anime-seasons", id],
-    queryFn: () => fetch(apiUrl(`/api/anime/${id}/seasons`)).then(r => r.json()),
+    queryFn: () => fetch(apiUrl(`/api/anime/${id}/seasons`), { headers: withClientHeader() }).then(r => r.json()),
     staleTime: 15 * 60 * 1000,
   });
 
   const { data: episodesData, isLoading: episodesLoading, isError: episodesError } =
     useQuery<{ episodes: Episode[]; nextAiring: { episode: number; airsAt: number } | null }>({
       queryKey: ["anime-episodes", id],
-      queryFn: () => fetch(apiUrl(`/api/anime/${id}/episodes`)).then(r => r.json()),
+      queryFn: () => fetch(apiUrl(`/api/anime/${id}/episodes`), { headers: withClientHeader() }).then(r => r.json()),
       enabled: !!id,
       staleTime: 30 * 60 * 1000,
     });
@@ -619,7 +620,7 @@ export function Watch() {
     queryKey: ["skip-times", id, currentEp?.number, videoDuration ?? 0],
     queryFn: async () => {
       const dur = videoDuration && videoDuration > 0 ? `?duration=${Math.round(videoDuration)}` : "";
-      const r = await fetch(apiUrl(`/api/anime/${id}/skip-times/${currentEp!.number}${dur}`));
+      const r = await fetch(apiUrl(`/api/anime/${id}/skip-times/${currentEp!.number}${dur}`), { headers: withClientHeader() });
       if (!r.ok) return { op: null, ed: null };
       return (await r.json()) as {
         op: { start: number; end: number } | null;
@@ -740,7 +741,15 @@ export function Watch() {
       <div className="flex-1 flex flex-col min-w-0 overflow-y-auto overflow-x-hidden">
 
         {/* Player */}
-        <div className="w-full bg-black shrink-0 relative">
+        {/* PERF: CSS containment on the player container — prevents layout
+            thrashing when the video player initializes and reflows. The
+            player's internal layout changes don't bubble up to the rest of
+            the page, so the post-transition "settle" lag is reduced.
+            Pure CSS — no animation changes. */}
+        <div
+          className="w-full bg-black shrink-0 relative"
+          style={{ contain: "layout style paint" }}
+        >
 
           {/* NOTE: StreamProgressBar (the red bar that animated across the top
               of the player during loading) was REMOVED here per user request.
@@ -1222,6 +1231,15 @@ export function Watch() {
                   onPointerEnter={() => aired && !isSelected && prefetchEpisodeStream(ep.id)}
                   disabled={!aired}
                   title={!aired ? "Not yet aired" : undefined}
+                  style={{
+                    // ── PERF: content-visibility auto-skips rendering for offscreen
+                    // episode buttons. Huge win for long-running anime (One Piece =
+                    // 1175 episodes). contain-intrinsic-size gives the browser a
+                    // placeholder height so scroll position stays stable before
+                    // the real content paints. Pure CSS — no animation changes.
+                    contentVisibility: "auto",
+                    containIntrinsicSize: "70px",
+                  }}
                   className={cn(
                     "flex gap-3 p-2 w-full text-left transition-all relative rounded-sm overflow-hidden border group",
                     !aired
@@ -1241,7 +1259,7 @@ export function Watch() {
                     {(ep.thumbnail || animeDetails?.posterUrl) && (
                       <img
                         src={ep.thumbnail || animeDetails?.posterUrl}
-                        loading="eager"
+                        loading="lazy"
                         decoding="async"
                         className={cn(
                           "w-full h-full object-cover transition-transform duration-500",

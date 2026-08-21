@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { cn } from "../lib/utils";
 import { apiUrl } from "../lib/api";
+import { withClientHeader } from "../lib/custom-fetch";
 import { squishyTap } from "../lib/transitions";
 
 interface AnimeDetails {
@@ -75,14 +76,14 @@ function CountdownTimer({ airsAt, episode }: { airsAt: number; episode: number }
 function useAnimeDetails(id: number) {
   return useQuery<AnimeDetails>({
     queryKey: ["anime-details", id],
-    queryFn: () => fetch(apiUrl(`/api/anime/${id}/details`)).then(r => r.json()),
+    queryFn: () => fetch(apiUrl(`/api/anime/${id}/details`), { headers: withClientHeader() }).then(r => r.json()),
     enabled: !!id, staleTime: 15 * 60 * 1000, gcTime: 30 * 60 * 1000,
   });
 }
 function useAnimeSeasons(id: number) {
   return useQuery<{ seasons: Season[] }>({
     queryKey: ["anime-seasons", id],
-    queryFn: () => fetch(apiUrl(`/api/anime/${id}/seasons`)).then(r => r.json()),
+    queryFn: () => fetch(apiUrl(`/api/anime/${id}/seasons`), { headers: withClientHeader() }).then(r => r.json()),
     enabled: !!id, staleTime: 20 * 60 * 1000,
   });
 }
