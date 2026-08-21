@@ -1,71 +1,51 @@
-// Core provider — default Megaplay embed (anix.at source via the new stream API).
-// Supports sub and dub. NO hsub on this server (only AniNico carries hsub).
+// Core provider — uses the VidStream (?p=vs) Megaplay player for its UI
+// (user preference: "looks rich"). The site tab is labelled "Core" but the
+// underlying API endpoint is `?p=vs`.
 //
-// The new stream API exposes a fast "/pop" endpoint that pre-checks which
-// audio tracks each provider actually has for an episode. We use it instead
-// of probing each URL ourselves — single round-trip per episode (cached 10 min).
-//
-// URL: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/{type}
-//      (type = "sub" | "dub")
+// URL STRATEGY (per user spec):
+//   1. PRIMARY — Read the URL directly from the /pop endpoint's `vs` entry.
+//      /pop returns the FULL URL (env-baked host + ?p=vs query) — no need
+//      to construct or probe anything. The /pop endpoint's built-in audio
+//      checker already knows whether sub/dub exist for this episode.
+//   2. FALLBACK — If /pop doesn't have the URL (entry missing or field
+//      absent), construct the URL using EMBED_API_URL (user-given pattern).
+//      Both the /pop call and the fallback use the same env, so changing
+//      EMBED_API_URL changes both.
+//   3. NOT AVAILABLE — If even the fallback doesn't apply (it always does
+//      for Core), the UI shows "Stream Unavailable".
 //
 // /pop: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/pop
-//       returns servers[] with provider="default" carrying urls.{sub,dub}
-//
-// The embed API origin is read from EMBED_API_URL (defaults to the public
-// animani render instance). Set EMBED_API_URL in your environment to point at
-// your own hosted instance.
+//       → servers[].urls.{sub,dub}  (no hsub on Core — only AniNico has it)
 
 import { json } from "../core/new-provider-utils.js";
+import { getPopEntry, POP_EMBED_API_URL } from "../core/pop-fetcher.js";
 
-const EMBED_API_URL = (process.env.EMBED_API_URL || "https://animani58hggktstisruarusrusrirustis.onrender.com")
-  .replace(/\/+$/, "");
+// Core uses the VidStream player (?p=vs).
+const POP_PROVIDER_ID = "vs";
 
-// This provider's id within the /pop servers[] array. Core = "default".
-const POP_PROVIDER_ID = "default";
-
-// ── /pop cache ───────────────────────────────────────────────────────────────
-// One round-trip per (anilistId, epNum) instead of three probes per server.
-const POP_CACHE = new Map(); // key → { data, expires }
-const POP_TTL   = 10 * 60 * 1000; // 10 minutes for successful probes
-const POP_ERR   = 60 * 1000;       // 1 minute for failed probes
-
-async function fetchPop(anilistId, epNum) {
-  const key   = `${anilistId}:${epNum}`;
-  const now   = Date.now();
-  const cache = POP_CACHE.get(key);
-  if (cache && now < cache.expires) return cache.data;
-
-  const url = `${EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/pop`;
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
-    if (!res.ok) {
-      POP_CACHE.set(key, { data: null, expires: now + POP_ERR });
-      return null;
-    }
-    const data = await res.json();
-    POP_CACHE.set(key, { data, expires: now + POP_TTL });
-    return data;
-  } catch {
-    POP_CACHE.set(key, { data: null, expires: now + POP_ERR });
-    return null;
-  }
-}
-
-// Pull the Core provider entry out of /pop's servers[] array.
-async function getMyPopEntry(anilistId, epNum) {
-  const pop = await fetchPop(anilistId, epNum);
-  if (!pop?.servers) return null;
-  return pop.servers.find((s) => s.provider === POP_PROVIDER_ID) ?? null;
-}
-
+// Fallback URL constructor — only used when /pop doesn't have the URL.
 function embedUrl(anilistId, epNum, type) {
-  return `${EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/${type}`;
+  return `${POP_EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/${type}?p=vs`;
 }
 
 async function handleWatch(anilistId, audio, epNum) {
-  // Core only carries sub + dub — coerce hsub → sub so the route stays valid.
+  // Core only carries sub + dub — coerce hsub → sub so the route stays valid
+  // even if a stale URL with ?lang=hsub is hit.
   const type = audio === "dub" ? "dub" : "sub";
-  const url  = embedUrl(anilistId, epNum, type);
+
+  // ── PRIMARY: read the URL directly from /pop ────────────────────────────────
+  // /pop already returns the complete URL with the env-baked host and the
+  // correct ?p=vs query — no need to construct anything.
+  const entry = await getPopEntry(anilistId, epNum, POP_PROVIDER_ID);
+  let url = entry?.urls?.[type] ?? null;
+
+  // ── FALLBACK: construct URL with env (user-given pattern) ──────────────────
+  // Used when /pop is down, missing the entry, or missing the field.
+  // The env-baked URL keeps both paths in sync with the same EMBED_API_URL.
+  if (!url) {
+    url = embedUrl(anilistId, epNum, type);
+  }
+
   return json({
     anilistId: Number(anilistId),
     episode:   Number(epNum),
@@ -80,15 +60,14 @@ async function handleWatch(anilistId, audio, epNum) {
   });
 }
 
-// Real per-episode availability — uses the /pop endpoint's "default" entry.
-// Returns only the audio codes the API actually has for this episode+server.
-//
-// Hardcoded labels per the spec:
+// Real per-episode audio availability — reads /pop's `vs` entry directly.
+// /pop has its own built-in checker, so the urls{} keys are exactly what's
+// available. Hardcoded labels per the spec:
 //   sub  → "Japanese"
 //   dub  → "English"
-// (Core never has hsub — only AniNico does — so we never return hsub here.)
+// (Core never has hsub — only AniNico does.)
 export async function getAudioOptions(anilistId, epNum) {
-  const entry = await getMyPopEntry(anilistId, epNum);
+  const entry = await getPopEntry(anilistId, epNum, POP_PROVIDER_ID);
   if (!entry?.urls) return [];
   const out = [];
   if (entry.urls.sub) out.push({ code: "sub", label: "Japanese" });

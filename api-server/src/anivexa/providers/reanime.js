@@ -1,64 +1,37 @@
-// ReAnime provider — uses the new stream API's "/pop" endpoint to fetch
-// already-resolved FlixCloud.cc embed URLs (no reanime.to scraping anymore).
+// ReAnime provider — uses /pop to fetch already-resolved FlixCloud.cc embed URLs.
 //
-// Per the user's instruction: "Like the reanime is added in the api only no
-// need to use it on the site itself you can use the API" — so the entire
-// previous reanime.to scraper (search → resolveSeries → fetchServers →
-// serversForAudio) is REPLACED with a single /pop request. The new API already
-// knows which AniList ID maps to which FlixCloud embed token, so we just read
-// the URLs out of its servers[] entry.
+// The entire reanime.to scraper (search/resolveSeries/fetchServers) was REMOVED
+// because the new /pop endpoint already does that resolution server-side.
+// /pop's `re` provider entry returns direct flixcloud.cc URLs we just hand to
+// the iframe.
 //
-// /pop returns provider="re" with urls.{sub,dub} pointing directly at
-// flixcloud.cc — no further resolution needed.
+// URL STRATEGY (per user spec):
+//   1. PRIMARY — Read the URL directly from the /pop endpoint's `re` entry.
+//      /pop returns the FULL flixcloud.cc URL — no need to construct or probe.
+//   2. NOT AVAILABLE — If /pop doesn't have the entry OR the URL for the
+//      requested audio type, return empty streams (UI shows "Stream
+//      Unavailable"). NO env-constructed fallback — ReAnime's URLs are
+//      fundamentally different (a separate flixcloud.cc domain, not our
+//      embed API), so we can't synthesize one.
 //
-// URL: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/pop
-//      → servers[] entry with provider="re"
-//      → entry.urls.{sub,dub} are direct flixcloud.cc embed URLs
+// /pop: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/pop
+//       → servers[] with provider="re" → urls.{sub,dub}
+//          sub = https://flixcloud.cc/e/<id>?v=1
+//          dub = https://flixcloud.cc/e/<id>?a=1
 
 import { json } from "../core/new-provider-utils.js";
-
-const EMBED_API_URL = (process.env.EMBED_API_URL || "https://animani58hggktstisruarusrusrirustis.onrender.com")
-  .replace(/\/+$/, "");
+import { getPopEntry } from "../core/pop-fetcher.js";
 
 const POP_PROVIDER_ID = "re";
 
-// ── /pop cache (shared via module-level Map) ────────────────────────────────
-const POP_CACHE = new Map();
-const POP_TTL   = 10 * 60 * 1000;
-const POP_ERR   = 60 * 1000;
-
-async function fetchPop(anilistId, epNum) {
-  const key   = `${anilistId}:${epNum}`;
-  const now   = Date.now();
-  const cache = POP_CACHE.get(key);
-  if (cache && now < cache.expires) return cache.data;
-
-  const url = `${EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/pop`;
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
-    if (!res.ok) {
-      POP_CACHE.set(key, { data: null, expires: now + POP_ERR });
-      return null;
-    }
-    const data = await res.json();
-    POP_CACHE.set(key, { data, expires: now + POP_TTL });
-    return data;
-  } catch {
-    POP_CACHE.set(key, { data: null, expires: now + POP_ERR });
-    return null;
-  }
-}
-
-async function getMyPopEntry(anilistId, epNum) {
-  const pop = await fetchPop(anilistId, epNum);
-  if (!pop?.servers) return null;
-  return pop.servers.find((s) => s.provider === POP_PROVIDER_ID) ?? null;
-}
-
 async function handleWatch(anilistId, audio, epNum) {
-  const entry = await getMyPopEntry(anilistId, epNum);
+  // Read URL directly from /pop — no env-constructed fallback for ReAnime
+  // (its URLs are on a different host we can't synthesize).
+  const entry = await getPopEntry(anilistId, epNum, POP_PROVIDER_ID);
   const url   = entry?.urls?.[audio] ?? null;
+
   if (!url) {
+    // /pop didn't return a stream for this server+audio → "not available"
     return json({
       anilistId: Number(anilistId),
       episode:   Number(epNum),
@@ -66,6 +39,7 @@ async function handleWatch(anilistId, audio, epNum) {
       streams:   [],
     });
   }
+
   return json({
     anilistId: Number(anilistId),
     episode:   Number(epNum),
@@ -79,13 +53,13 @@ async function handleWatch(anilistId, audio, epNum) {
   });
 }
 
-// Real per-episode sub/dub availability — uses the /pop endpoint's "re" entry.
+// Real per-episode sub/dub availability — reads /pop's `re` entry.
 // Hardcoded labels per the spec:
 //   sub  → "Japanese"
 //   dub  → "English"
 // (ReAnime never has hsub via the API.)
 export async function getAudioOptions(anilistId, epNum) {
-  const entry = await getMyPopEntry(anilistId, epNum);
+  const entry = await getPopEntry(anilistId, epNum, POP_PROVIDER_ID);
   if (!entry?.urls) return [];
   const out = [];
   if (entry.urls.sub) out.push({ code: "sub", label: "Japanese" });
