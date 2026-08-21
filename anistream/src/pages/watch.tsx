@@ -56,21 +56,20 @@ interface AudioOption { code: string; label: string }
 
 // Hardcoded provider list. Each tab is fetched only when the user actually
 // selects it (or on first load for the default), never all at once.
-// Core is the Koyeb-hosted embed server supporting sub, dub, and hsub — recommended default.
-// VidStream uses Koyeb with the VidStream player (sub + dub only).
-// AniNico uses the Railway-hosted API (sub, dub, hsub — probed per-episode).
-// ReAnime is embed-only (FlixCloud iframe).
-// AniDB is the only real HLS scraper.
-// ★ marks the recommended default server.
+// Server → API provider mapping (per the new /pop endpoint spec):
+//   core      → "default"  (Megaplay embed, sub + dub)
+//   vidstream → "vs"        (Megaplay VidStream player, sub + dub)
+//   aninico   → "am"        (Megaplay AniNico player, sub + dub + hsub)
+//   reanime   → "re"        (direct flixcloud.cc iframe, sub + dub)
+// ★ marks the recommended default server. Only AniNico carries hsub.
 const PROVIDER_TABS = [
   { id: "core",      label: "Core",      recommended: true  },
   { id: "vidstream", label: "VidStream", recommended: false },
   { id: "aninico",   label: "AniNico",   recommended: false },
   { id: "reanime",   label: "ReAnime",   recommended: false },
-  { id: "anidbapp",  label: "AniDB",     recommended: false },
 ] as const;
 type ProviderId = typeof PROVIDER_TABS[number]["id"];
-// Core is the recommended default — Koyeb-hosted, fast, sub + dub + hsub.
+// Core is the recommended default — Megaplay embed with sub + dub.
 const DEFAULT_PROVIDER: ProviderId = "core";
 
 interface Episode {
@@ -1359,85 +1358,56 @@ export function Watch() {
                 </button>
               </div>
               <div className="overflow-y-auto flex-1 p-2">
-                {/* ── AUDIO MODAL — Japanese is ALWAYS shown as the first,
-                    hardcoded, always-available option (highlighted as the
-                    default selection). Other dubs (English, H-Sub, etc.)
-                    load in the BACKGROUND via the audio-options probe and
-                    appear below Japanese once they resolve.
+                {/* ── AUDIO MODAL — shows ONLY what the active server supports ──
+                    No more hardcoded "Japanese (sub)" at the top. The list is
+                    driven entirely by `currentAudioOptions` (returned by the
+                    backend's /pop-based audio-options probe for the active
+                    provider). If the active server doesn't have hsub, it
+                    simply won't appear here.
 
-                    CRITICAL: the stream itself does NOT wait for these
-                    other dubs to load — Japanese launches instantly via
-                    `selectedLang="sub"` and the audio-options fetch is a
-                    separate, non-blocking query. This modal is purely for
-                    users who want to SWITCH to a different track after
-                    playback has already started.
+                    Labels are HARDCODED by the backend per the spec:
+                      sub  → "Japanese"
+                      dub  → "English"
+                      hsub → "Japanese (H-Sub)"  (only AniNico ever has this)
 
-                    If the user opens this modal before the probe resolves,
-                    they see Japanese (selected) + a small "Loading other
-                    audio options…" hint. No spinner-as-selectable-option,
-                    no false "English Dub" placeholder. */}
+                    While the probe is in-flight, show a "Loading audio
+                    options…" hint instead of placeholders — the stream itself
+                    does NOT wait for this probe, so Japanese still launches
+                    instantly via selectedLang="sub" before the modal opens. */}
 
-                {/* ── Japanese (sub) — always present, always selectable ── */}
-                <button
-                  onClick={() => selectAudio("sub")}
-                  className={cn(
-                    "w-full flex items-center justify-between px-4 py-3 text-left text-sm font-bold rounded-sm transition-all",
-                    activeLang === "sub"
-                      ? "bg-primary/15 text-primary"
-                      : "text-white/60 hover:text-white hover:bg-white/5"
-                  )}
-                >
-                  <span className="flex items-center gap-2">
-                    {stream?.isHardSub ? "Japanese (H-Sub)" : "Japanese"}
-                  </span>
-                  {activeLang === "sub" && (
-                    <span className="w-2 h-2 rounded-full bg-primary shadow-[0_0_8px_rgba(220,38,38,0.6)]" />
-                  )}
-                </button>
-
-                {/* ── Other dubs from the active provider — load in background ──
-                    Filter out "sub" since Japanese is already hardcoded above.
-                    While the probe is in-flight (currentAudioOptions is empty
-                    OR only contains "sub"), show a subtle "loading other
-                    audio options" hint. Once real dubs arrive, render each
-                    as a selectable button. */}
                 {(() => {
-                  const otherDubs = currentAudioOptions.filter(
-                    (o) => o.code !== "sub"
-                  );
-                  const probeLoading =
-                    currentAudioOptions.length === 0 ||
-                    (currentAudioOptions.length === 1 &&
-                      currentAudioOptions[0]?.code === "sub");
-
-                  if (probeLoading) {
+                  // Probe in-flight: empty list = backend hasn't responded yet.
+                  // Show a subtle loading hint instead of false options.
+                  if (currentAudioOptions.length === 0) {
                     return (
-                      <div className="px-4 py-3 mt-1 border-t border-white/[0.05]">
+                      <div className="px-4 py-3">
                         <p className="text-white/30 text-[11px] font-semibold">
-                          Loading other audio options…
+                          Loading audio options…
                         </p>
                       </div>
                     );
                   }
 
-                  if (otherDubs.length === 0) {
-                    return (
-                      <div className="px-4 py-3 mt-1 border-t border-white/[0.05]">
-                        <p className="text-white/25 text-[11px] font-medium">
-                          No other audio tracks on this server
-                        </p>
-                      </div>
-                    );
-                  }
+                  // Stable order: sub first (Japanese), then dub (English),
+                  // then hsub (Japanese H-Sub) — matches how the user expects
+                  // audio options to be listed.
+                  const ORDER = ["sub", "dub", "hsub"];
+                  const sorted = [...currentAudioOptions].sort(
+                    (a, b) => ORDER.indexOf(a.code) - ORDER.indexOf(b.code)
+                  );
 
                   return (
-                    <div className="mt-1 border-t border-white/[0.05]">
-                      {otherDubs.map(({ code, label }) => {
+                    <div>
+                      {sorted.map(({ code, label }) => {
                         const isActive = activeLang === code;
+                        // Trust the backend's label, but fall back to the same
+                        // hardcoded mapping in case the backend omits a label.
                         const displayLabel =
-                          code === "sub" && stream?.isHardSub
-                            ? `${label} (H-Sub)`
-                            : label;
+                          label ||
+                          (code === "sub"  ? "Japanese"
+                          : code === "dub"  ? "English"
+                          : code === "hsub" ? "Japanese (H-Sub)"
+                          : code.charAt(0).toUpperCase() + code.slice(1));
                         return (
                           <button
                             key={code}

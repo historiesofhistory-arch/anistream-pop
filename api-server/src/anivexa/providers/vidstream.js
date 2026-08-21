@@ -1,37 +1,55 @@
 // VidStream provider — embed API using the ?p=vs server.
-// Supports sub and dub only (no hsub).
+// Supports sub and dub only (no hsub). Same anix.at source as Core.
+//
+// Uses the /pop endpoint to get checked sub/dub availability per episode
+// instead of probing each URL ourselves — single round-trip per episode.
 //
 // URL: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/{type}?p=vs
-// EMBED_API_URL is read from env (defaults to the public Koyeb instance).
+//      type = "sub" | "dub"
+//
+// /pop: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/pop
+//       returns servers[] with provider="vs" carrying urls.{sub,dub}
+//
+// EMBED_API_URL is read from env (defaults to the animani render instance).
 
 import { json } from "../core/new-provider-utils.js";
 
-const EMBED_API_URL = (process.env.EMBED_API_URL || "https://worthwhile-audrey-botnestbots-d45e9faf.koyeb.app")
+const EMBED_API_URL = (process.env.EMBED_API_URL || "https://animani58hggktstisruarusrusrirustis.onrender.com")
   .replace(/\/+$/, "");
 
-// ── Availability probe ─────────────────────────────────────────────────────
-// Koyeb always returns HTTP 200, but unavailable streams return a short
-// plain-text body: "error code: 502" (~16 bytes).
-// Valid embed pages are 200+ bytes of HTML with an iframe inside.
+const POP_PROVIDER_ID = "vs";
 
-const PROBE_CACHE = new Map(); // url → { ok: bool, expires: number }
-const PROBE_TTL   = 10 * 60 * 1000;
-const PROBE_ERR   = 60 * 1000;
+// ── /pop cache (shared via module-level Map) ────────────────────────────────
+const POP_CACHE = new Map();
+const POP_TTL   = 10 * 60 * 1000;
+const POP_ERR   = 60 * 1000;
 
-async function probeEmbed(url) {
-  const now    = Date.now();
-  const cached = PROBE_CACHE.get(url);
-  if (cached && now < cached.expires) return cached.ok;
+async function fetchPop(anilistId, epNum) {
+  const key   = `${anilistId}:${epNum}`;
+  const now   = Date.now();
+  const cache = POP_CACHE.get(key);
+  if (cache && now < cache.expires) return cache.data;
+
+  const url = `${EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/pop`;
   try {
-    const res  = await fetch(url, { signal: AbortSignal.timeout(8_000) });
-    const text = await res.text();
-    const ok   = text.length >= 200 && !text.includes("error code:");
-    PROBE_CACHE.set(url, { ok, expires: now + (ok ? PROBE_TTL : PROBE_ERR) });
-    return ok;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    if (!res.ok) {
+      POP_CACHE.set(key, { data: null, expires: now + POP_ERR });
+      return null;
+    }
+    const data = await res.json();
+    POP_CACHE.set(key, { data, expires: now + POP_TTL });
+    return data;
   } catch {
-    PROBE_CACHE.set(url, { ok: false, expires: now + PROBE_ERR });
-    return false;
+    POP_CACHE.set(key, { data: null, expires: now + POP_ERR });
+    return null;
   }
+}
+
+async function getMyPopEntry(anilistId, epNum) {
+  const pop = await fetchPop(anilistId, epNum);
+  if (!pop?.servers) return null;
+  return pop.servers.find((s) => s.provider === POP_PROVIDER_ID) ?? null;
 }
 
 function embedUrl(anilistId, epNum, type) {
@@ -54,29 +72,18 @@ async function handleWatch(anilistId, audio, epNum) {
   });
 }
 
-// Real per-episode availability — probes using the ?p=am endpoint.
-//
-// WHY: VidStream uses megaplay.buzz which always returns a player HTML
-// template regardless of whether the audio track exists. The ?p=am
-// endpoint (AniNico backend) uses vivibebe.site, which correctly
-// returns a short error body for missing tracks. Since all backends
-// pull from the same anix.at source, ?p=am probe results apply to
-// VidStream availability too.
-//
-// VidStream doesn't support hsub, so we only probe sub and dub.
-const PROBE_BASE_AM = EMBED_API_URL + "/api/stream/anix.at";
-
-function probeUrl(anilistId, epNum, type) {
-  return `${PROBE_BASE_AM}/${anilistId}/${epNum}/${type}?p=am`;
-}
-
+// Real per-episode sub/dub availability — uses the /pop endpoint's "vs" entry.
+// Hardcoded labels per the spec:
+//   sub  → "Japanese"
+//   dub  → "English"
+// (VidStream never has hsub.)
 export async function getAudioOptions(anilistId, epNum) {
-  const types = [
-    { code: "sub", label: "Japanese", url: probeUrl(anilistId, epNum, "sub") },
-    { code: "dub", label: "English",  url: probeUrl(anilistId, epNum, "dub") },
-  ];
-  const checks = await Promise.all(types.map(async (t) => ({ ...t, ok: await probeEmbed(t.url) })));
-  return checks.filter((t) => t.ok).map(({ code, label }) => ({ code, label }));
+  const entry = await getMyPopEntry(anilistId, epNum);
+  if (!entry?.urls) return [];
+  const out = [];
+  if (entry.urls.sub) out.push({ code: "sub", label: "Japanese" });
+  if (entry.urls.dub) out.push({ code: "dub", label: "English" });
+  return out;
 }
 
 export default {

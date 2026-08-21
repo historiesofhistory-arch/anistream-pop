@@ -1,42 +1,56 @@
-// AniNico provider — uses the embed API with the AniNico server (?p=am).
-// The API returns an embeddable HTML page directly; the frontend renders it
-// as an iframe. Supports sub, dub, and hsub (hard-subtitled).
+// AniNico provider — uses the embed API with the AniNeco (?p=am) server.
+// This is the ONLY server that supports hsub (hard-subtitled Japanese audio).
 //
-// Availability is probed per-episode: the embed API always returns HTTP 200,
-// but unavailable streams return a short error body ("error code: 502" ≈ 16
-// bytes). Valid embed pages are 200+ bytes of HTML with an iframe inside.
+// Uses the /pop endpoint to get checked sub/dub/hsub availability per episode
+// instead of probing each URL ourselves — single round-trip per episode.
 //
 // Endpoint: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/{type}?p=am
-// type: "sub" | "dub" | "hsub"
+//           type = "sub" | "dub" | "hsub"
 //
-// EMBED_API_URL is read from env (defaults to the public Koyeb instance).
+// /pop: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/pop
+//       returns servers[] with provider="am" carrying urls.{sub,dub,hsub}
+//
+// EMBED_API_URL is read from env (defaults to the animani render instance).
 // Set it in your environment to point at your own hosted instance.
 
 import { json } from "../core/new-provider-utils.js";
 
-const EMBED_API_URL = (process.env.EMBED_API_URL || "https://worthwhile-audrey-botnestbots-d45e9faf.koyeb.app")
+const EMBED_API_URL = (process.env.EMBED_API_URL || "https://animani58hggktstisruarusrusrirustis.onrender.com")
   .replace(/\/+$/, "");
 
-// ── Availability probe ─────────────────────────────────────────────────────
-const PROBE_CACHE = new Map(); // url → { ok: bool, expires: number }
-const PROBE_TTL   = 10 * 60 * 1000; // 10 minutes for successful probes
-const PROBE_ERR   = 60 * 1000;       // 1 minute for failed probes
+const POP_PROVIDER_ID = "am";
 
-async function probeEmbed(url) {
-  const now    = Date.now();
-  const cached = PROBE_CACHE.get(url);
-  if (cached && now < cached.expires) return cached.ok;
+// ── /pop cache (shared via module-level Map) ────────────────────────────────
+const POP_CACHE = new Map();
+const POP_TTL   = 10 * 60 * 1000;
+const POP_ERR   = 60 * 1000;
+
+async function fetchPop(anilistId, epNum) {
+  const key   = `${anilistId}:${epNum}`;
+  const now   = Date.now();
+  const cache = POP_CACHE.get(key);
+  if (cache && now < cache.expires) return cache.data;
+
+  const url = `${EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/pop`;
   try {
-    const res  = await fetch(url, { signal: AbortSignal.timeout(8_000) });
-    const text = await res.text();
-    // Valid pages are HTML (200+ bytes); Koyeb errors are short plain-text
-    const ok   = text.length >= 200 && !text.includes("error code:");
-    PROBE_CACHE.set(url, { ok, expires: now + (ok ? PROBE_TTL : PROBE_ERR) });
-    return ok;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    if (!res.ok) {
+      POP_CACHE.set(key, { data: null, expires: now + POP_ERR });
+      return null;
+    }
+    const data = await res.json();
+    POP_CACHE.set(key, { data, expires: now + POP_TTL });
+    return data;
   } catch {
-    PROBE_CACHE.set(url, { ok: false, expires: now + PROBE_ERR });
-    return false;
+    POP_CACHE.set(key, { data: null, expires: now + POP_ERR });
+    return null;
   }
+}
+
+async function getMyPopEntry(anilistId, epNum) {
+  const pop = await fetchPop(anilistId, epNum);
+  if (!pop?.servers) return null;
+  return pop.servers.find((s) => s.provider === POP_PROVIDER_ID) ?? null;
 }
 
 function embedUrl(anilistId, epNum, type) {
@@ -68,16 +82,19 @@ async function handleWatch(anilistId, audio, epNum) {
   });
 }
 
-// Real per-episode availability — probes sub, dub, and hsub in parallel.
-// Only returns options where the Koyeb server actually has content.
+// Real per-episode sub/dub/hsub availability — uses the /pop endpoint's "am" entry.
+// Hardcoded labels per the spec:
+//   sub  → "Japanese"
+//   dub  → "English"
+//   hsub → "Japanese (H-Sub)"  ← only AniNico ever returns this
 export async function getAudioOptions(anilistId, epNum) {
-  const types = [
-    { code: "sub",  label: "Japanese",   url: embedUrl(anilistId, epNum, "sub")  },
-    { code: "dub",  label: "English",    url: embedUrl(anilistId, epNum, "dub")  },
-    { code: "hsub", label: "JPN H-Sub",  url: embedUrl(anilistId, epNum, "hsub") },
-  ];
-  const checks = await Promise.all(types.map(async (t) => ({ ...t, ok: await probeEmbed(t.url) })));
-  return checks.filter((t) => t.ok).map(({ code, label }) => ({ code, label }));
+  const entry = await getMyPopEntry(anilistId, epNum);
+  if (!entry?.urls) return [];
+  const out = [];
+  if (entry.urls.sub)  out.push({ code: "sub",  label: "Japanese" });
+  if (entry.urls.dub)  out.push({ code: "dub",  label: "English" });
+  if (entry.urls.hsub) out.push({ code: "hsub", label: "Japanese (H-Sub)" });
+  return out;
 }
 
 export default {

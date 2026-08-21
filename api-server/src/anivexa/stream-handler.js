@@ -1,26 +1,20 @@
 /**
  * Anivexa streaming bridge.
  *
- * AniNeko and AniZone were removed: both resolve to CDNs that are
- * fundamentally incompatible with the Cloudflare Worker HLS proxy —
- * AniNeko's signed CDN URLs are locked to the ASN that requested them
- * (they embed `asn=<our-network>` in the signature, so any edge proxy on a
- * different network gets a 403 no matter what headers it sends), and
- * AniZone's CDN sits behind Cloudflare itself, which blocks/challenges
- * Cloudflare-Worker-to-Cloudflare-origin traffic as bot activity. Neither
- * is fixable by tweaking the proxy — confirmed by fetching both CDNs
- * directly (works) vs. through the Worker (403 / Cloudflare challenge).
+ * Four providers active now (per the new spec):
+ *   - Core (default)    — Megaplay embed, sub + dub
+ *   - VidStream (?p=vs) — Megaplay embed via vidstream player, sub + dub
+ *   - AniNico (?p=am)    — Megaplay embed via anineko player, sub + dub + hsub
+ *   - ReAnime           — direct flixcloud.cc iframe URLs (via /pop endpoint)
  *
- * Only 3 providers are active now: AniDB App (the only real scraper —
- * curl-based session scraping of anidb.app), VidWish (embed-only, no HLS
- * extraction), and Reanime (embed-only, returns FlixCloud.cc iframe URLs
- * directly rather than replicating Reanime's WASM-based stream-URL
- * decryption, which is fragile and unnecessary when the iframe works fine
- * on its own). With only one real scraper in the mix, episode fetching
- * stays fast — no more racing/falling back through slow scrapers.
+ * All four providers use the new /pop endpoint to get pre-checked audio
+ * availability per episode (sub/dub/hsub) — no more per-URL probing on our
+ * side. Single round-trip per episode, cached 10 minutes.
+ *
+ * AniDB (the curl-based scraper) and the legacy reanime.to scraper were
+ * removed: the new stream API already does that resolution server-side.
  */
 // @ts-nocheck
-import * as anidbappMod  from "./providers/anidbapp.js";
 import * as ainicoMod    from "./providers/aninico.js";
 import * as coreMod      from "./providers/core.js";
 import * as reanimeMod   from "./providers/reanime.js";
@@ -44,28 +38,25 @@ function buildEmbedProxyUrl(rawUrl) {
 
 const PROVIDERS = [
   { name: "core",      handler: coreMod.default,       getAudioOptions: coreMod.getAudioOptions      },
-  { name: "anidbapp",  handler: anidbappMod.default,   getAudioOptions: anidbappMod.getAudioOptions  },
+  { name: "vidstream", handler: vidstreamMod.default,   getAudioOptions: vidstreamMod.getAudioOptions },
   { name: "aninico",   handler: ainicoMod.default,      getAudioOptions: ainicoMod.getAudioOptions    },
   { name: "reanime",   handler: reanimeMod.default,     getAudioOptions: reanimeMod.getAudioOptions   },
-  { name: "vidstream", handler: vidstreamMod.default,   getAudioOptions: vidstreamMod.getAudioOptions },
 ];
 
-// Core is the recommended default — Koyeb-hosted embed with
-// sub, dub, and hsub support.
+// Core is the recommended default — Megaplay embed with sub + dub.
 export const DEFAULT_PROVIDER = "core";
 
 // Human-readable labels — short, single-word, matching the hardcoded tabs.
 export const PROVIDER_LABELS = {
   core:      "Core",
-  anidbapp:  "AniDB",
+  vidstream: "VidStream",
   aninico:   "AniNico",
   reanime:   "ReAnime",
-  vidstream: "VidStream",
 };
 
 // Fallback order — Core first (default/recommended), then VidStream,
-// then ReAnime, then AniDB (real scraper), then AniNico.
-const FALLBACK_ORDER = ["core", "vidstream", "reanime", "anidbapp", "aninico"];
+// then AniNico (the only one with hsub), then ReAnime (direct flixcloud).
+const FALLBACK_ORDER = ["core", "vidstream", "aninico", "reanime"];
 
 function getProvider(name) {
   return PROVIDERS.find((p) => p.name === name) ?? null;
@@ -125,8 +116,8 @@ const PROVIDER_TIMEOUT_MS = 18_000; // 18 s per provider
  * (the UI's provider tabs) decides which provider to ask.
  *
  * @param {string} anilistId
- * @param {string} providerName  "anidbapp" | "anineko" | "anizone"
- * @param {"sub"|"dub"} lang
+ * @param {string} providerName  "core" | "vidstream" | "aninico" | "reanime"
+ * @param {"sub"|"dub"|"hsub"} lang
  * @param {number} epNum
  * @returns {Promise<object|null>}
  */

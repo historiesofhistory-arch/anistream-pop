@@ -13,6 +13,14 @@ const ARM_URL = "https://relations.yuna.moe/api/ids";
 const ANISKIP = "https://api.aniskip.com/v2";
 const UA      = "Mozilla/5.0 (compatible; AniStream/1.0)";
 
+// ── Episode metadata + clear-logo source ───────────────────────────────────
+// Defaults to api.bine.me — same shape just4anime had (AniList id → TVDB
+// clearlogo + per-episode thumbnails), but with richer per-episode data
+// (multiple image quality variants, simkl_id, tvdb season/episode).
+// Override via the EPISODES_API_URL env var if you self-host.
+const EPISODES_API_URL = (process.env.EPISODES_API_URL || "https://api.bine.me")
+  .replace(/\/+$/, ""); // strip trailing slash(es)
+
 async function alQuery<T = unknown>(
   query: string,
   variables?: Record<string, unknown>,
@@ -678,28 +686,28 @@ router.get("/anime/schedule", async (req: Request, res: Response) => {
 //
 // Mapping strategy (3-tier fallback):
 //
-//   1. PRIMARY — just4anime.online API
-//      `https://just4anime.online/api/episodes/<id>?full=true`
-//      Returns JSON with `data.images[]` containing a Clearlogo entry.
-//      They've already done the AniList→TVDB mapping server-side, so this
-//      has near-100% hit rate for any anime TVDB has a logo for.
+//   1. PRIMARY — episodes API (api.bine.me by default)
+//      `GET {EPISODES_API_URL}/api/episodes/<id>`
+//      Returns `artworks.clear_logo` directly in the same response as the
+//      episode list — no separate TVDB scrape needed.
+//      Hit rate: ~95%+ for any anime TVDB has a logo for.
 //
 //   2. FALLBACK — direct TVDB scrape via slug guessing
 //      Query AniList for titles, slugify, fetch https://thetvdb.com/series/<slug>
 //      and regex-scan the HTML for clearlogo URLs.
-//      Used when just4anime.online is down or returns success=false.
+//      Used when the episodes API is down or has no clear_logo for the anime.
 //
 //   3. LAST RESORT — return null
 //      Caller (frontend) falls back to a spinner-only loading state.
 //
 // Permanent in-memory cache keyed by AniList ID — once resolved, future
-// calls are instant (TVDB slugs/just4anime responses don't change).
+// calls are instant (TVDB slugs / episodes API responses don't change).
 //
 // Returns:
-//   { logoUrl: string | null, source: "just4anime" | "tvdb" | null }
+//   { logoUrl: string | null, source: "episodes-api" | "tvdb" | null }
 // ─────────────────────────────────────────────────────────────────────────────
 
-const J4A_API = "https://just4anime.online/api/episodes";
+const J4A_API = EPISODES_API_URL + "/api/episodes";
 const TVDB_BASE = "https://thetvdb.com/series/";
 const TVDB_LOGO_RE =
   /https:\/\/artworks\.thetvdb\.com\/banners\/v4\/series\/\d+\/clearlogo\/[a-f0-9]+\.png/g;
@@ -719,28 +727,25 @@ function tvdbSlug(t: string): string {
 // Permanent cache: AniList ID -> { logoUrl, source } | null
 const logoCache = new Map<number, { logoUrl: string; source: string } | null>();
 
-// PRIMARY: scrape from just4anime.online API
+// PRIMARY: scrape clear-logo from the episodes API (api.bine.me by default)
+//
+// api.bine.me returns artworks.clear_logo directly in the same response
+// as the episode list — no separate TVDB scrape needed. Falls through
+// to the TVDB-slug fallback below if the episodes API is down or has
+// no clear_logo for this anime.
 async function fetchLogoFromJust4Anime(anilistId: number): Promise<string | null> {
   try {
-    const res = await fetch(`${J4A_API}/${anilistId}?full=true`, {
+    const res = await fetch(`${J4A_API}/${anilistId}`, {
       headers: {
         "User-Agent": UA,
         "Accept": "application/json",
-        "Referer": "https://just4anime.online/",
       },
     });
     if (!res.ok) return null;
     const json = await res.json() as {
-      success?: boolean;
-      data?: { images?: Array<{ coverType?: string; url?: string }> };
+      artworks?: { clear_logo?: string | null } | null;
     };
-    if (!json.success || !json.data?.images) return null;
-    // Find the Clearlogo entry — there may be multiple images (poster, banner,
-    // clearlogo, etc.). We only want the stylized text logo.
-    const clearlogo = json.data.images.find(
-      (img) => img.coverType === "Clearlogo" && img.url,
-    );
-    return clearlogo?.url ?? null;
+    return json?.artworks?.clear_logo ?? null;
   } catch {
     return null;
   }
@@ -775,10 +780,10 @@ async function resolveLogo(anilistId: number): Promise<{ logoUrl: string; source
 
   let result: { logoUrl: string; source: string } | null = null;
 
-  // ── TIER 1: just4anime.online ────────────────────────────────────────────
+  // ── TIER 1: episodes API (api.bine.me by default) ────────────────────────
   const j4aLogo = await fetchLogoFromJust4Anime(anilistId);
   if (j4aLogo) {
-    result = { logoUrl: j4aLogo, source: "just4anime" };
+    result = { logoUrl: j4aLogo, source: "episodes-api" };
     logoCache.set(anilistId, result);
     return result;
   }
@@ -865,32 +870,31 @@ const getDetails = mkSwr<unknown>(15 * 60_000, 5 * 60_000, async (id: string) =>
   // ── Episode count verification for big anime ──────────────────────────────
   // AniList sometimes includes specials/movies/OVAs in the episode count
   // (e.g., Doraemon shows 927 but only ~600 actual episodes are available).
-  // For FINISHED big anime (>100 episodes), cross-check with just4anime's
-  // totalEpisodes field and use the SMALLER count (actual available episodes).
-  // For ONGOING anime, DON'T reduce the count — just4anime may just not have
-  // caught up yet (e.g., Doraemon 2005: just4anime has 687, AniList says 928).
+  // For FINISHED big anime (>100 episodes), cross-check with the episodes API
+  // (api.bine.me) total_aired field and use the SMALLER count (actual available
+  // episodes). For ONGOING anime, DON'T reduce the count — the episodes API may
+  // just not have caught up yet.
   let verifiedEpisodeCount = m.episodes ?? null;
   if (verifiedEpisodeCount && verifiedEpisodeCount > 100 && m.status === "FINISHED") {
     try {
-      const j4aRes = await fetch(`${J4A_API}/${m.id}?full=true`, {
+      const epsRes = await fetch(`${J4A_API}/${m.id}`, {
         headers: {
           "User-Agent": UA,
           "Accept": "application/json",
-          "Referer": "https://just4anime.online/",
         },
       });
-      if (j4aRes.ok) {
-        const j4aJson = await j4aRes.json() as { success?: boolean; data?: { totalEpisodes?: number } };
-        if (j4aJson.success && j4aJson.data?.totalEpisodes) {
-          const j4aCount = j4aJson.data.totalEpisodes;
-          // Use the smaller count — just4anime has the actual available episodes
-          if (j4aCount < verifiedEpisodeCount) {
-            verifiedEpisodeCount = j4aCount;
+      if (epsRes.ok) {
+        const epsJson = await epsRes.json() as { episodes?: { total_aired?: number } };
+        if (epsJson.episodes?.total_aired) {
+          const apiCount = epsJson.episodes.total_aired;
+          // Use the smaller count — episodes API has the actual available eps
+          if (apiCount < verifiedEpisodeCount) {
+            verifiedEpisodeCount = apiCount;
           }
         }
       }
     } catch {
-      // just4anime check failed — keep AniList's count (no harm)
+      // Episodes API check failed — keep AniList's count (no harm)
     }
   }
 
@@ -968,108 +972,109 @@ router.get("/anime/:id/seasons", async (req: Request, res: Response) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /anime/:id/episodes  (just4anime primary, AniList+Kitsu fallback)
-// ─────────────────────────────────────────────────────────────────────────────
+// GET /anime/:id/episodes  (api.bine.me primary, AniList+Kitsu fallback)
+// ────────────────────────────────────────────────────────────────────────────
 //
 // EPISODE DATA SOURCE — 2-tier fallback:
 //
-//   TIER 1 (PRIMARY): just4anime.online API
-//     GET https://just4anime.online/api/episodes/<id>?full=true
-//     Returns data.episodes[] with rich metadata:
-//       { id, number, title, titleJa, image, airDate, duration, isFiller, hasAired }
-//     The `image` field is a TVDB episode screencap thumbnail — much higher
-//     quality than Kitsu's thumbnails.
-//     Also returns data.nextAiringEpisode + data.nextAiringDate for countdown.
-//     Hit rate: ~95%+ for any anime TVDB has indexed.
+//   TIER 1 (PRIMARY): api.bine.me episodes API
+//     GET {EPISODES_API_URL}/api/episodes/<anilistId>
+//       (default EPISODES_API_URL = https://api.bine.me)
+//     Returns:
+//       artworks.clear_logo            — transparent PNG logo for the brand overlay
+//       episodes.total_aired           — actual available episode count
+//       episodes.first_aired / last_aired / next_scheduled — bookends + countdown
+//       episodes.list[]                — per-episode metadata with multiple
+//                                        image-quality variants:
+//                                          still_url_w_jpg   (web JPEG, picked)
+//                                          still_url_c_jpg   (compact JPEG)
+//                                          still_url_m_jpg   (mobile JPEG)
+//                                          still_url_w / _c / _m (webp variants)
 //
 //   TIER 2 (FALLBACK): AniList + Kitsu (original implementation below)
 //     AniList for authoritative aired count + nextAiringEpisode.
 //     Kitsu via ARM for episode titles + thumbnails.
-//     Used when just4anime is down, returns success=false, or has no episodes.
+//     Used when the episodes API is down, returns no episodes, or fails.
 //     DO NOT MODIFY — keep the original logic intact as a safety net.
 //
 // Both paths return the SAME response shape so the frontend doesn't care
 // which source produced the data.
 
-interface J4AEpisode {
-  id:        string;
-  number:    number;
-  title:     string;
-  titleJa?:  string;
-  image:     string;
-  airDate:   string;
-  duration?: number;
-  isFiller:  boolean;
-  hasAired:  boolean;
-  rating?:   string;
+interface BineEpisode {
+  number:        number;
+  title?:        string | null;
+  air_date?:     string | null;
+  aired?:        boolean;
+  still_url_w_jpg?: string | null;
 }
-interface J4AEpisodesResponse {
-  success?: boolean;
-  data?: {
-    id:                   string | number;
-    malId?:               number;
-    title?:               string;
-    titleJa?:             string;
-    totalEpisodes?:       number;
-    currentEpisode?:      number;
-    nextAiringEpisode?:   number | null;
-    nextAiringDate?:      string | null;
-    episodes?:            J4AEpisode[];
+interface BineEpisodesResponse {
+  anilist_id?: number;
+  title?:      string;
+  status?:     string;
+  ongoing?:    boolean;
+  artworks?:   { clear_logo?: string | null; poster?: string | null; banner?: string | null } | null;
+  episodes?: {
+    total_aired?:     number;
+    total_scheduled?: number;
+    specials_count?:  number;
+    first_aired?:     BineEpisode | null;
+    last_aired?:      BineEpisode | null;
+    next_scheduled?:  BineEpisode | null;
+    list?:            BineEpisode[];
   };
 }
 
-// Fetch episodes from just4anime — returns null on any failure
+// Fetch episodes from api.bine.me — returns null on any failure
 // (caller falls back to AniList+Kitsu). Cached via the same SWR wrapper as
 // the existing implementation, so repeated calls are instant.
+//
+// Picks `still_url_w_jpg` for thumbnails — the wide JPEG variant is the best
+// trade-off for web use (sharp thumbnails, small payload, no webp fallback needed).
 async function fetchEpisodesFromJust4Anime(anilistId: number): Promise<{
   episodes:  unknown[];
   nextAiring: { episode: number; airsAt: number } | null;
 } | null> {
   try {
-    const res = await fetch(`${J4A_API}/${anilistId}?full=true`, {
+    const res = await fetch(`${J4A_API}/${anilistId}`, {
       headers: {
         "User-Agent": UA,
         "Accept": "application/json",
-        "Referer": "https://just4anime.online/",
       },
     });
     if (!res.ok) return null;
-    const json = (await res.json()) as J4AEpisodesResponse;
-    if (!json.success || !json.data?.episodes?.length) return null;
+    const json = (await res.json()) as BineEpisodesResponse;
+    const eps = json.episodes?.list;
+    if (!eps || !eps.length) return null;
 
-    const data = json.data;
-    const eps = data.episodes!;
-
-    // Convert just4anime's nextAiringDate (ISO string) to ms timestamp.
-    // If nextAiringEpisode is null/undefined, there's no upcoming episode.
+    // api.bine.me returns next_scheduled only when an episode is upcoming.
+    // Convert its ISO air_date to an absolute ms timestamp for the countdown.
     let nextAiring: { episode: number; airsAt: number } | null = null;
-    if (data.nextAiringEpisode && data.nextAiringDate) {
-      const airsAt = new Date(data.nextAiringDate).getTime();
+    const next = json.episodes?.next_scheduled;
+    if (next?.number && next.air_date && !next.aired) {
+      const airsAt = new Date(next.air_date).getTime();
       if (Number.isFinite(airsAt)) {
-        nextAiring = { episode: data.nextAiringEpisode, airsAt };
+        nextAiring = { episode: next.number, airsAt };
       }
     }
 
     // Map to our existing episode shape so the frontend stays unchanged.
     // Key transformation notes:
-    //   - `id` becomes the episode NUMBER (we use numeric IDs for routing).
-    //     The original `id` (e.g. "21-1") is just4anime's internal format
-    //     and not what our frontend expects.
-    //   - `image` → `thumbnail` (better quality TVDB screencap)
-    //   - `isFiller` → `filler`
-    //   - `hasAired` → `aired`
-    //   - `airsAt` only attached to the single next-airing episode
-    //   - hasSub/hasDub default to true (we don't get this from just4anime)
+    //   - `id` is the episode NUMBER (we use numeric IDs for routing).
+    //   - `still_url_w_jpg` → `thumbnail` (wide JPEG variant — best for web)
+    //   - `aired` flag from API (true/false); if missing, infer from air_date
+    //   - `airsAt` only attached to the single next-scheduled episode
+    //   - hasSub/hasDub default to true (the episodes API doesn't carry this)
     const episodes = eps.map((ep) => {
-      const isNextAiring = nextAiring?.episode === ep.number && !ep.hasAired;
+      const aired = ep.aired ?? (ep.air_date ? new Date(ep.air_date).getTime() <= Date.now() : true);
+      const isNextAiring = nextAiring?.episode === ep.number && !aired;
       return {
         id:        ep.number,
         number:    ep.number,
         title:     ep.title || null,
-        thumbnail: ep.image || null,
-        filler:    !!ep.isFiller,
-        airDate:   ep.airDate || null,
-        aired:     !!ep.hasAired,
+        thumbnail: ep.still_url_w_jpg || null,
+        filler:    false,
+        airDate:   ep.air_date || null,
+        aired,
         airsAt:    isNextAiring ? nextAiring!.airsAt : null,
         hasSub:    true,
         hasDub:    true,
@@ -1271,14 +1276,14 @@ router.get("/anime/:id/skip-times/:epNum", async (req: Request, res: Response) =
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /anime/:id/stream/:epNum?lang=sub|dub|hsub&provider=anidbapp|aninico|reanime|vidstream
+// GET /anime/:id/stream/:epNum?lang=sub|dub|hsub&provider=core|vidstream|aninico|reanime
 // (Anivexa — explicit single provider, no racing). The UI's provider tabs
 // call this with exactly the provider the user picked (or the default,
-// "vidstream", on first load) — a stalled provider only ever affects its own
+// "core", on first load) — a stalled provider only ever affects its own
 // tab, never the whole page.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VALID_PROVIDERS = ["anidbapp", "aninico", "core", "reanime", "vidstream"] as const;
+const VALID_PROVIDERS = ["core", "vidstream", "aninico", "reanime"] as const;
 type ProviderName = typeof VALID_PROVIDERS[number];
 
 // Lazy-import the JS stream handler once; re-used for every request.
@@ -1324,9 +1329,9 @@ router.get("/anime/:id/stream/:epNum", async (req: Request, res: Response) => {
   const epNum     = Number(req.params.epNum);
   // `lang` used to be locked to "sub"|"dub" — now it's whatever real audio
   // code the picker offered (still "sub"/"dub" for the binary providers,
-  // but can be an exact language code like AniDB's own for a second dub).
+  // but can be "hsub" for AniNico).
   const lang      = (req.query.lang as string) || "sub";
-  const provider  = (req.query.provider as string) || "vidstream";
+  const provider  = (req.query.provider as string) || "core";
 
   if (isNaN(epNum)) return void res.status(400).json({ error: "Invalid episode number" });
   if (!VALID_PROVIDERS.includes(provider as ProviderName)) {
@@ -1354,7 +1359,7 @@ const audioOptionsSwr = mkSwr<{ code: string; label: string }[]>(3 * 60 * 60_000
 router.get("/anime/:id/audio-options/:epNum", async (req: Request, res: Response) => {
   const anilistId = req.params.id!;
   const epNum     = Number(req.params.epNum);
-  const provider  = (req.query.provider as string) || "vidstream";
+  const provider  = (req.query.provider as string) || "core";
 
   if (isNaN(epNum)) return void res.status(400).json({ error: "Invalid episode number" });
   if (!VALID_PROVIDERS.includes(provider as ProviderName)) {
@@ -1377,7 +1382,7 @@ router.get("/anime/:id/audio-options/:epNum/find-provider", async (req: Request,
   const anilistId = req.params.id!;
   const epNum     = Number(req.params.epNum);
   const code      = (req.query.code as string) || "sub";
-  const current   = (req.query.provider as string) || "anidbapp";
+  const current   = (req.query.provider as string) || "core";
 
   if (isNaN(epNum)) return void res.status(400).json({ error: "Invalid episode number" });
 
