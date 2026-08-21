@@ -1106,19 +1106,52 @@ const getEpisodes = mkSwr<unknown>(30 * 60_000, 10 * 60_000, async (id: string) 
     const md = await alQuery<{
       Media: {
         episodes:          number | null;
+        format:            string | null;
         status:            string | null;
         nextAiringEpisode: { episode: number; timeUntilAiring: number } | null;
       }
     }>(
       `query($id: Int) {
         Media(id: $id, type: ANIME) {
-          episodes status
+          episodes format status
           nextAiringEpisode { episode timeUntilAiring }
         }
       }`,
       { id: anilistId },
     );
-    const { episodes: totalEps, status, nextAiringEpisode } = md.Media;
+    const { episodes: totalEps, format, status, nextAiringEpisode } = md.Media;
+
+    // ── SPECIAL FORMAT SHORT-CIRCUIT ───────────────────────────────────────
+    // Per user spec: AniList correctly marks SPECIAL-format anime (single-ep
+    // OADs, recap movies, etc.). For these, don't call api.bine.me — just
+    // generate N episode entries (1, 2, 3...) using AniList's own episode
+    // count. api.bine.me sometimes returns the parent series's episodes for
+    // specials (e.g., for the AoT Final Chapters special, bine.me returned
+    // 2 episodes of the parent AoT anime — confusing and wrong).
+    //
+    // Example: a special anime with AniList episodes=3 →
+    //   ep 1, ep 2, ep 3 (all marked aired if status=FINISHED)
+    //   no thumbnails (api.bine.me is bypassed), no per-ep titles
+    if (format === "SPECIAL" && totalEps && totalEps > 0) {
+      const airedFlag = status === "FINISHED" || status === "CANCELLED" || status === "RELEASING";
+      const episodes = Array.from({ length: totalEps }, (_, i) => {
+        const num = i + 1;
+        return {
+          id:        num,
+          number:    num,
+          title:     null,           // no per-ep title for specials
+          thumbnail: null,           // no thumbnails (api.bine.me bypassed)
+          filler:    false,
+          airDate:   null,
+          aired:     airedFlag,
+          airsAt:    null,            // specials don't carry countdown timers
+          hasSub:    true,
+          hasDub:    true,
+        };
+      });
+      return { episodes, nextAiring: anilistNextAiring };
+    }
+
     if (nextAiringEpisode) {
       anilistNextAiring = {
         episode: nextAiringEpisode.episode,
