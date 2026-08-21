@@ -1,26 +1,20 @@
-// AniNico provider — uses the embed API with the AniNico (?p=am) server.
+// AniNico provider — uses /pop's `am` entry (Megaplay AniNico player, ?p=am).
 // This is the ONLY server that supports hsub (hard-subtitled Japanese audio).
 //
 // URL STRATEGY (per user spec):
-//   1. PRIMARY — Read the URL directly from the /pop endpoint's `am` entry.
-//      /pop returns the FULL URL (env-baked host + ?p=am query + the audio
-//      type already in the path) — no need to construct or probe anything.
-//   2. FALLBACK — Construct URL using EMBED_API_URL if /pop is missing it.
-//   3. NOT AVAILABLE — UI shows "Stream Unavailable" if neither path works.
+//   Read the URL directly from /pop's `am` entry. NO FALLBACK.
+//   If /pop doesn't return a stream (entry missing or URL field absent),
+//   return empty streams → UI shows "Stream Unavailable".
+//
+//   The /co fallback is for Core ONLY — AniNico never uses it.
 //
 // /pop: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/pop
-//       → servers[].urls.{sub,dub,hsub}
-//          Only AniNico ever carries hsub — /pop knows this.
+//       → servers[] with provider="am" carrying urls.{sub,dub,hsub?}
 
 import { json } from "../core/new-provider-utils.js";
-import { getPopEntry, POP_EMBED_API_URL } from "../core/pop-fetcher.js";
+import { getPopEntry } from "../core/pop-fetcher.js";
 
 const POP_PROVIDER_ID = "am";
-
-// Fallback URL constructor — only used when /pop doesn't have the URL.
-function embedUrl(anilistId, epNum, type) {
-  return `${POP_EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/${type}?p=am`;
-}
 
 function resolveType(audio) {
   if (audio === "dub")  return "dub";
@@ -31,13 +25,18 @@ function resolveType(audio) {
 async function handleWatch(anilistId, audio, epNum) {
   const type = resolveType(audio);
 
-  // PRIMARY: read URL directly from /pop
+  // Read URL directly from /pop — NO fallback for AniNico.
   const entry = await getPopEntry(anilistId, epNum, POP_PROVIDER_ID);
-  let url = entry?.urls?.[type] ?? null;
+  const url   = entry?.urls?.[type] ?? null;
 
-  // FALLBACK: env-constructed URL (user-given pattern)
+  // /pop didn't return a stream → "Stream Unavailable"
   if (!url) {
-    url = embedUrl(anilistId, epNum, type);
+    return json({
+      anilistId: Number(anilistId),
+      episode:   Number(epNum),
+      audio,
+      streams:   [],
+    });
   }
 
   return json({

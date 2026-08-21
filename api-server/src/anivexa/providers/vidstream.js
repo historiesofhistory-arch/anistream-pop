@@ -1,40 +1,38 @@
-// VidStream provider — uses the plain default Megaplay embed (no ?p= param).
-// The site tab is still labelled "VidStream" but the underlying API endpoint
-// is now the default Megaplay player. (Swap with Core — Core took the ?p=vs
-// player because it "looks rich".)
+// VidStream provider — uses /pop's `default` entry (plain Megaplay, no ?p= param).
+// The site tab is still labelled "VidStream" — swapped with Core so Core
+// got the "rich-looking" ?p=vs player.
 //
 // URL STRATEGY (per user spec):
-//   1. PRIMARY — Read the URL directly from the /pop endpoint's `default`
-//      entry. /pop returns the FULL URL (env-baked host, no ?p= query) — no
-//      need to construct or probe anything.
-//   2. FALLBACK — Construct URL using EMBED_API_URL if /pop is missing it.
-//   3. NOT AVAILABLE — UI shows "Stream Unavailable" if neither path works.
+//   Read the URL directly from /pop's `default` entry. NO FALLBACK.
+//   If /pop doesn't return a stream (entry missing or URL field absent),
+//   return empty streams → UI shows "Stream Unavailable".
+//
+//   The /co fallback is for Core ONLY — VidStream never uses it.
 //
 // /pop: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/pop
-//       → servers[].urls.{sub,dub}  (no hsub on VidStream)
+//       → servers[] with provider="default" carrying urls.{sub,dub}
 
 import { json } from "../core/new-provider-utils.js";
-import { getPopEntry, POP_EMBED_API_URL } from "../core/pop-fetcher.js";
+import { getPopEntry } from "../core/pop-fetcher.js";
 
-// VidStream uses the plain default endpoint (no ?p=vs).
 const POP_PROVIDER_ID = "default";
-
-// Fallback URL constructor — only used when /pop doesn't have the URL.
-function embedUrl(anilistId, epNum, type) {
-  return `${POP_EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/${type}`;
-}
 
 async function handleWatch(anilistId, audio, epNum) {
   // VidStream only carries sub + dub — coerce hsub → sub.
   const type = audio === "dub" ? "dub" : "sub";
 
-  // PRIMARY: read URL directly from /pop
+  // Read URL directly from /pop — NO fallback for VidStream.
   const entry = await getPopEntry(anilistId, epNum, POP_PROVIDER_ID);
-  let url = entry?.urls?.[type] ?? null;
+  const url   = entry?.urls?.[type] ?? null;
 
-  // FALLBACK: env-constructed URL (user-given pattern)
+  // /pop didn't return a stream → "Stream Unavailable"
   if (!url) {
-    url = embedUrl(anilistId, epNum, type);
+    return json({
+      anilistId: Number(anilistId),
+      episode:   Number(epNum),
+      audio,
+      streams:   [],
+    });
   }
 
   return json({

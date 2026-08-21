@@ -179,21 +179,21 @@ export async function streamFromProvider(anilistId, providerName, lang, epNum) {
 /**
  * Fetch a stream for the requested provider and audio track.
  *
- * Missing-audio-track and provider-is-down are handled very differently on
- * purpose (this used to conflate the two, which surprised users — picking
- * "English" on a Japanese-only AniDB episode silently teleported them to a
- * whole different server):
- *   1. Requested provider + requested lang — try it as asked.
- *   2. Requested provider + the OTHER lang — the provider is fine, it just
- *      doesn't have that track for this episode; stay on the SAME provider
- *      and serve whatever audio it does have instead of jumping servers.
- *      Flagged as `audioFallback: true` with `currentLang` set to whatever
- *      actually played, so the UI can correct its own audio label instead
- *      of claiming a language that isn't actually playing.
- *   3. Only if the requested provider can't produce a stream in EITHER
- *      language (i.e. it's genuinely down/broken for this episode) do we
- *      fall through to the other active providers — that's the real
- *      `switchedProvider` case.
+ * NO CROSS-PROVIDER FALLBACK (per user spec):
+ *   Each server stands on its own. If pop doesn't return a stream for the
+ *   requested provider+audio, the UI shows "Stream Unavailable" — we do NOT
+ *   silently switch to another server. The user picks the server explicitly,
+ *   and switching behind their back is worse UX than showing "not available".
+ *
+ *   The ONLY internal fallback in the system is Core's /co endpoint, which
+ *   fires inside core.js's handleWatch() when pop is unreachable — that's
+ *   invisible to this function (Core always returns a non-null result when
+ *   its /co fallback works).
+ *
+ *   Same-provider other-language fallback is preserved: if the user picked
+ *   "dub" but the provider only has "sub" for this episode, we stay on the
+ *   SAME provider and serve "sub" instead (flagged as `audioFallback: true`
+ *   with `currentLang` set to whatever actually played).
  *
  * @returns {Promise<(object & { requestedProvider: string, switchedProvider: boolean, audioFallback?: boolean })|null>}
  */
@@ -204,6 +204,9 @@ export async function streamWithFallback(anilistId, providerName, lang, epNum) {
   const direct = await fetchFromProvider(requested, anilistId, lang, epNum);
   if (direct) return { ...direct, requestedProvider: providerName, switchedProvider: false };
 
+  // Same-provider other-language fallback — stay on the SAME server, just
+  // serve whatever audio it has for this episode instead of the requested
+  // track. UI shows `audioFallback: true` + corrects the audio label.
   const otherLang = lang === "dub" ? "sub" : "dub";
   const sameProviderOtherLang = await fetchFromProvider(requested, anilistId, otherLang, epNum);
   if (sameProviderOtherLang) {
@@ -215,15 +218,10 @@ export async function streamWithFallback(anilistId, providerName, lang, epNum) {
     };
   }
 
-  const rest = FALLBACK_ORDER.map(getProvider).filter((p) => p && p.name !== requested.name);
-  for (const p of rest) {
-    for (const tryLang of [lang, otherLang]) {
-      const result = await fetchFromProvider(p, anilistId, tryLang, epNum);
-      if (result) {
-        return { ...result, requestedProvider: providerName, switchedProvider: true };
-      }
-    }
-  }
+  // NO cross-provider fallback — respect the user's server choice.
+  // If the requested provider can't serve this episode, return null and let
+  // the UI show "Stream Unavailable" with a "Switch Server" prompt.
+  // (Core's /co fallback is handled inside core.js's handleWatch, invisible here.)
   return null;
 }
 

@@ -1,50 +1,51 @@
 // Core provider — uses the VidStream (?p=vs) Megaplay player for its UI
 // (user preference: "looks rich"). The site tab is labelled "Core" but the
-// underlying API endpoint is `?p=vs`.
+// underlying stream comes from /pop's `vs` entry.
 //
-// URL STRATEGY (per user spec):
-//   1. PRIMARY — Read the URL directly from the /pop endpoint's `vs` entry.
-//      /pop returns the FULL URL (env-baked host + ?p=vs query) — no need
-//      to construct or probe anything. The /pop endpoint's built-in audio
-//      checker already knows whether sub/dub exist for this episode.
-//   2. FALLBACK — If /pop doesn't have the URL (entry missing or field
-//      absent), construct the URL using EMBED_API_URL (user-given pattern).
-//      Both the /pop call and the fallback use the same env, so changing
-//      EMBED_API_URL changes both.
-//   3. NOT AVAILABLE — If even the fallback doesn't apply (it always does
-//      for Core), the UI shows "Stream Unavailable".
+// FALLBACK STRATEGY (Core ONLY — per user spec):
+//   When /pop is not working (unreachable, 5xx, or returns no URL), Core
+//   falls back to the /co endpoint — the original Core embed pattern:
+//     {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/{type}/co
+//
+//   The /co endpoint:
+//     - Supports sub + dub only (NO hsub — confirmed via direct test, returns HTTP 502 for hsub)
+//     - hsub audio is coerced to sub before the fallback fires
+//     - URL is env-configurable via EMBED_API_URL
+//
+//   No other provider has a fallback. VidStream, AniNico, and ReAnime all
+//   return empty streams (UI shows "Stream Unavailable") when /pop doesn't
+//   return a URL — only Core gets the /co safety net.
 //
 // /pop: GET {EMBED_API_URL}/api/stream/anix.at/{anilistId}/{epNum}/pop
-//       → servers[].urls.{sub,dub}  (no hsub on Core — only AniNico has it)
+//       → servers[] with provider="vs" carrying urls.{sub,dub}
 
 import { json } from "../core/new-provider-utils.js";
 import { getPopEntry, POP_EMBED_API_URL } from "../core/pop-fetcher.js";
 
-// Core uses the VidStream player (?p=vs).
+// Core reads /pop's `vs` entry — that's where the "rich-looking" VidStream
+// player URLs live.
 const POP_PROVIDER_ID = "vs";
 
-// Fallback URL constructor — only used when /pop doesn't have the URL.
-function embedUrl(anilistId, epNum, type) {
-  return `${POP_EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/${type}?p=vs`;
+// FALLBACK: only for Core — uses the /co endpoint (original Core embed pattern).
+// /co doesn't support hsub (caller coerces hsub → sub before calling this).
+// Reads POP_EMBED_API_URL from env so changing EMBED_API_URL changes both
+// /pop and this fallback in lockstep.
+function coFallbackUrl(anilistId, epNum, type) {
+  return `${POP_EMBED_API_URL}/api/stream/anix.at/${anilistId}/${epNum}/${type}/co`;
 }
 
 async function handleWatch(anilistId, audio, epNum) {
-  // Core only carries sub + dub — coerce hsub → sub so the route stays valid
-  // even if a stale URL with ?lang=hsub is hit.
+  // /co doesn't support hsub — coerce to sub. (Pop's `vs` entry only has
+  // sub+dub too, so this coercion applies to BOTH the pop URL and the fallback.)
   const type = audio === "dub" ? "dub" : "sub";
 
-  // ── PRIMARY: read the URL directly from /pop ────────────────────────────────
-  // /pop already returns the complete URL with the env-baked host and the
-  // correct ?p=vs query — no need to construct anything.
+  // PRIMARY: read URL directly from /pop's `vs` entry
   const entry = await getPopEntry(anilistId, epNum, POP_PROVIDER_ID);
-  let url = entry?.urls?.[type] ?? null;
+  const popUrl = entry?.urls?.[type] ?? null;
 
-  // ── FALLBACK: construct URL with env (user-given pattern) ──────────────────
-  // Used when /pop is down, missing the entry, or missing the field.
-  // The env-baked URL keeps both paths in sync with the same EMBED_API_URL.
-  if (!url) {
-    url = embedUrl(anilistId, epNum, type);
-  }
+  // FALLBACK (Core-only): when /pop is not working or returns no URL,
+  // fall back to the /co endpoint. This is the ONLY fallback in the system.
+  const url = popUrl ?? coFallbackUrl(anilistId, epNum, type);
 
   return json({
     anilistId: Number(anilistId),
@@ -60,7 +61,7 @@ async function handleWatch(anilistId, audio, epNum) {
   });
 }
 
-// Real per-episode audio availability — reads /pop's `vs` entry directly.
+// Real per-episode audio availability — reads /pop's `vs` entry.
 // /pop has its own built-in checker, so the urls{} keys are exactly what's
 // available. Hardcoded labels per the spec:
 //   sub  → "Japanese"
