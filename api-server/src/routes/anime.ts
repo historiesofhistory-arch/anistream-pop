@@ -1,5 +1,11 @@
 import { Router }      from "express";
 import type { Request, Response } from "express";
+import { useMalForCatalog } from "../anivexa/mal/source-switch.js";
+import * as MalClient   from "../anivexa/mal/client.js";
+import {
+  malNodesToCards, malNodesToHeroes, malNodeToDetails,
+  malRelatedToSeasons, fetchMalDetailsByAnilistId,
+} from "../anivexa/mal/mapper.js";
 
 const router = Router();
 
@@ -190,6 +196,17 @@ function currentSeason(): { season: string; year: number } {
   return { season: s, year: yr };
 }
 
+// Returns the season AFTER the given one (used by MAL home for "Coming Soon").
+// Season names match AniList format (uppercase): WINTER, SPRING, SUMMER, FALL.
+function currentSeasonAfter(season: string, year: number): { season: string; year: number } {
+  const order = ["WINTER", "SPRING", "SUMMER", "FALL"];
+  const idx = order.indexOf(season.toUpperCase());
+  if (idx < 0) return currentSeason();
+  const nextIdx = (idx + 1) % 4;
+  const nextYear = nextIdx === 0 ? year + 1 : year;
+  return { season: order[nextIdx], year: nextYear };
+}
+
 const toCard = (m: AlMedia) => ({
   id:       m.id,
   title:    title(m),
@@ -296,9 +313,76 @@ const getHome = mkSwr<unknown>(10 * 60_000, 5 * 60_000, async () => {
 
 router.get("/home", async (_req: Request, res: Response) => {
   try {
+    // ── MAL DATA SOURCE ────────────────────────────────────────────────────────
+    // When DATA_SOURCE=mal, build the home page from MAL's ranking + season APIs.
+    // Returns the EXACT same response shape as the AniList version (so the
+    // frontend code doesn't change at all).
+    if (useMalForCatalog()) {
+      const { season, year } = currentSeason();
+      // MAL season names are lowercase ("winter"|"spring"|"summer"|"fall")
+      const malSeason = season.toLowerCase();
+
+      const [hero, popular, topRated, airing, movies, action, romance, fantasy] = await Promise.all([
+        MalClient.malRanking("bypopularity", 8),       // hero = most popular
+        MalClient.malRanking("bypopularity", 20),     // popular section
+        MalClient.malRanking("all", 20),               // top rated (by score)
+        MalClient.malSeason(year, malSeason, 20),       // currently airing
+        MalClient.malRanking("movie", 20),              // movies
+        MalClient.malRanking("favorite", 20),           // placeholder for action (MAL has no genre filter on rankings)
+        MalClient.malRanking("favorite", 20),           // placeholder for romance
+        MalClient.malRanking("favorite", 20),           // placeholder for fantasy
+      ]);
+
+      // Build hero items (richer shape — needs description, genres, banner, rating)
+      const heroItems = await malNodesToHeroes(hero);
+      // Build card arrays for each section (MAL ID → AniList ID translation)
+      const [
+        popularCards, topRatedCards, airingCards, movieCards,
+        actionCards, romanceCards, fantasyCards,
+      ] = await Promise.all([
+        malNodesToCards(popular),
+        malNodesToCards(topRated),
+        malNodesToCards(airing),
+        malNodesToCards(movies),
+        malNodesToCards(action),
+        malNodesToCards(romance),
+        malNodesToCards(fantasy),
+      ]);
+
+      // For the "upcoming" section, fetch next season
+      const nextSeason = currentSeasonAfter(season, year);
+      const upcomingMal = await MalClient.malSeason(nextSeason.year, nextSeason.season.toLowerCase(), 20);
+      const upcomingCards = await malNodesToCards(upcomingMal);
+
+      return res.json({
+        hero: heroItems,
+        sections: [
+          { title: "Trending Now",       items: heroItems.map((h) => ({ id: h.id, title: h.title, posterUrl: h.posterUrl, type: h.type, year: h.year })) },
+          { title: "Most Popular",       items: popularCards },
+          { title: "Currently Airing",   items: airingCards },
+          { title: "Top Rated All Time", items: topRatedCards },
+          { title: "Action & Adventure",items: actionCards },
+          { title: "Romance",            items: romanceCards },
+          { title: "Fantasy & Magic",   items: fantasyCards },
+          { title: "Movies",             items: movieCards },
+          { title: "Coming Soon",         items: upcomingCards },
+        ],
+      });
+    }
+
+    // ── ANILIST DATA SOURCE (default) ───────────────────────────────────────────
     res.json(await getHome("home"));
   } catch (e) {
     console.error("[home]", e);
+    // If MAL fails, try AniList as a fallback so the page never goes blank
+    if (useMalForCatalog()) {
+      try {
+        console.warn("[home] MAL failed, falling back to AniList");
+        return res.json(await getHome("home"));
+      } catch (e2) {
+        console.error("[home] AniList fallback also failed", e2);
+      }
+    }
     res.status(502).json({ error: "Failed to load home data" });
   }
 });
@@ -341,6 +425,20 @@ router.get("/anime/search", async (req: Request, res: Response) => {
   const q = ((req.query.q as string) ?? "").trim();
   if (!q) return void res.json({ results: [] });
   try {
+    // ── MAL DATA SOURCE ────────────────────────────────────────────────────────
+    // Search MAL + map results back to AniList card shape (translates IDs).
+    if (useMalForCatalog()) {
+      try {
+        const malResults = await MalClient.malSearch(q, 20);
+        const cards = await malNodesToCards(malResults);
+        return res.json({ results: cards });
+      } catch (e) {
+        console.error("[search] MAL failed, falling back to AniList", e);
+        // fall through to AniList
+      }
+    }
+
+    // ── ANILIST DATA SOURCE (default) ───────────────────────────────────────────
     const d = await alQuery<{ Page: { media: AlMedia[] } }>(SEARCH_Q, { q });
     res.json({ results: d.Page.media.map(toCard) });
   } catch (e) {
@@ -934,6 +1032,62 @@ const getDetails = mkSwr<unknown>(15 * 60_000, 5 * 60_000, async (id: string) =>
 
 router.get("/anime/:id/details", async (req: Request, res: Response) => {
   try {
+    // ── MAL DATA SOURCE ────────────────────────────────────────────────────────
+    // Translate anilist_id → mal_id via AniList's idMal field, then fetch from
+    // MAL. Returns the same response shape as the AniList route.
+    //
+    // FALLBACK: when MAL returns no episodeCount (often 0 for ongoing series
+    // like One Piece — MAL says 0, AniList says 1174), we fetch AniList's
+    // episode count separately and merge it in. This is a hybrid approach:
+    // MAL data for posters/synopses/scores, AniList for episode counts.
+    if (useMalForCatalog()) {
+      try {
+        const anilistId = Number(req.params.id);
+        const malNode = await fetchMalDetailsByAnilistId(anilistId, MalClient.malDetails);
+        if (malNode) {
+          const details = await malNodeToDetails(malNode, anilistId);
+
+          // If MAL returned no episode count (ongoing series), patch in
+          // AniList's count + nextAiringEpisode (MAL has neither).
+          if (details.episodeCount == null) {
+            try {
+              const md = await alQuery<{
+                Media: {
+                  episodes: number | null;
+                  nextAiringEpisode: { episode: number; timeUntilAiring: number } | null;
+                };
+              }>(
+                `query($id: Int) {
+                  Media(id: $id, type: ANIME) {
+                    episodes
+                    nextAiringEpisode { episode timeUntilAiring }
+                  }
+                }`,
+                { id: anilistId },
+              );
+              if (md.Media.episodes) details.episodeCount = md.Media.episodes;
+              if (md.Media.nextAiringEpisode) {
+                details.nextAiring = {
+                  episode: md.Media.nextAiringEpisode.episode,
+                  airsAt:  Date.now() + md.Media.nextAiringEpisode.timeUntilAiring * 1000,
+                };
+              }
+            } catch (e) {
+              console.warn("[details] AniList episode-count patch failed", e);
+            }
+          }
+
+          return res.json(details);
+        }
+        // No MAL ID for this anime — fall through to AniList
+        console.warn(`[details] anilist ${anilistId} has no MAL ID — falling back to AniList`);
+      } catch (e) {
+        console.error("[details] MAL failed, falling back to AniList", e);
+        // fall through to AniList
+      }
+    }
+
+    // ── ANILIST DATA SOURCE (default) ───────────────────────────────────────────
     res.json(await getDetails(req.params.id!));
   } catch (e) {
     console.error("[details]", e);
@@ -947,7 +1101,27 @@ router.get("/anime/:id/details", async (req: Request, res: Response) => {
 
 router.get("/anime/:id/seasons", async (req: Request, res: Response) => {
   try {
-    const d      = await alQuery<{ Media: AlMedia }>(DETAILS_Q, { id: Number(req.params.id) });
+    const anilistId = Number(req.params.id);
+
+    // ── MAL DATA SOURCE ────────────────────────────────────────────────────────
+    // Fetch MAL details (which include related_anime) + map to seasons shape.
+    if (useMalForCatalog()) {
+      try {
+        const malNode = await fetchMalDetailsByAnilistId(anilistId, MalClient.malDetails);
+        if (malNode) {
+          const related = MalClient.malRelatedAnime(malNode);
+          const seasonsResp = await malRelatedToSeasons(related, anilistId);
+          return res.json(seasonsResp);
+        }
+        // No MAL ID — fall through to AniList
+      } catch (e) {
+        console.error("[seasons] MAL failed, falling back to AniList", e);
+        // fall through
+      }
+    }
+
+    // ── ANILIST DATA SOURCE (default) ───────────────────────────────────────────
+    const d      = await alQuery<{ Media: AlMedia }>(DETAILS_Q, { id: anilistId });
     const edges  = d.Media.relations?.edges ?? [];
     const seasons = edges
       .filter(
@@ -958,7 +1132,7 @@ router.get("/anime/:id/seasons", async (req: Request, res: Response) => {
       .map((e) => ({
         id:        e.node.id,
         title:     title(e.node),
-        isCurrent: e.node.id === Number(req.params.id),
+        isCurrent: e.node.id === anilistId,
         posterUrl: cover(e.node),
         type:      e.node.format ?? null,
         episodes:  e.node.episodes ?? null,
@@ -1651,6 +1825,34 @@ const getUpcoming = mkSwr<unknown>(20 * 60_000, 10 * 60_000, async () => {
 
 router.get("/upcoming", async (_req: Request, res: Response) => {
   try {
+    // ── MAL DATA SOURCE ────────────────────────────────────────────────────────
+    // MAL has no dedicated "upcoming" filter. We use the NEXT season's anime —
+    // since the current season is airing, next season's anime are "upcoming".
+    // If next season has no data yet (very early), fall through to AniList.
+    if (useMalForCatalog()) {
+      try {
+        const { season, year } = currentSeason();
+        const next = currentSeasonAfter(season, year);
+        // Sort by "members" (most popular first) so the most anticipated
+        // upcoming shows appear at the top.
+        const malNodes = await MalClient.malSeason(next.year, next.season.toLowerCase(), 12, "members");
+        if (malNodes.length > 0) {
+          const cards = await malNodesToCards(malNodes);
+          return res.json({
+            items: cards.map((c) => ({
+              ...c,
+              episodeCount: null, // MAL doesn't expose episode count in season endpoint
+            })),
+          });
+        }
+        // MAL next season empty — fall through to AniList
+      } catch (e) {
+        console.error("[upcoming] MAL failed, falling back to AniList", e);
+        // fall through
+      }
+    }
+
+    // ── ANILIST DATA SOURCE (default) ───────────────────────────────────────────
     res.json(await getUpcoming("__upcoming__"));
   } catch (e) {
     console.error("[upcoming]", e);
@@ -1718,6 +1920,48 @@ router.get("/browse", async (req: Request, res: Response) => {
     const rawSort = typeof req.query.sort === "string" ? req.query.sort.toUpperCase() : "POPULARITY_DESC";
     const sort    = VALID_SORTS.has(rawSort) ? rawSort : "POPULARITY_DESC";
 
+    // ── MAL DATA SOURCE ────────────────────────────────────────────────────────
+    // MAL has a more limited browse API than AniList — no genre/year/season
+    // filters on rankings. We use:
+    //   - Search if `search` is provided
+    //   - Otherwise rankings by sort type (POPULARITY_DESC → bypopularity,
+    //     SCORE_DESC → all, TRENDING_DESC → airing)
+    // Filters (genre/year/season/format/status) are silently dropped on MAL —
+    // the user's selection still appears in the URL but doesn't restrict.
+    // Pagination is also limited — MAL returns up to 100 items per ranking
+    // call; we serve a single page of 18 from the result.
+    if (useMalForCatalog()) {
+      try {
+        let malNodes: Awaited<ReturnType<typeof MalClient.malSearch>>;
+        if (search) {
+          malNodes = await MalClient.malSearch(search, 18 * page);
+        } else {
+          // Map AniList sort to MAL ranking_type
+          const rankingType =
+            sort === "SCORE_DESC"      ? "all" :
+            sort === "TRENDING_DESC"    ? "airing" :
+            sort === "POPULARITY_DESC"  ? "bypopularity" :
+            /* default */                 "bypopularity";
+          malNodes = await MalClient.malRanking(rankingType, 18 * page);
+        }
+
+        // Slice for the requested page
+        const start = (page - 1) * 18;
+        const pageNodes = malNodes.slice(start, start + 18);
+        const cards = await malNodesToCards(pageNodes);
+
+        return res.json({
+          items: cards,
+          hasNextPage: malNodes.length > start + 18,
+          total: malNodes.length,
+        });
+      } catch (e) {
+        console.error("[browse] MAL failed, falling back to AniList", e);
+        // fall through to AniList
+      }
+    }
+
+    // ── ANILIST DATA SOURCE (default) ───────────────────────────────────────────
     const variables: Record<string, unknown> = {
       page, perPage: 18,
       sort: [sort],
